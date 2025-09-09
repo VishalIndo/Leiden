@@ -36,4 +36,4 @@ pip install -r requirements.txt
 ### Result
 
 ![3D UMAP rotation](output/umap3d_custom_detailed.gif)
-![3D UMAP rotation](assets/umap3d.gif)
+![3D UMAP rotation](output/umap3d_lib_detailed.gif)
