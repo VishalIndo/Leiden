@@ -6,8 +6,8 @@
 
 ## Features
 - End‑to‑end workflow in **`Leiden.ipynb`**: load data → preprocess → PCA → kNN graph → **Leiden** clusters → **UMAP (2D & 3D)**.
-- Optional rotating **3D UMAP GIF**.
-- 
+- Rotating **3D UMAP GIF**.
+  
 ---
 
 ## Quick Start
