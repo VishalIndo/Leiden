@@ -11,6 +11,10 @@ import random
 from queue import SimpleQueue
 from math import exp
 import leidenalg as la  # for Scanpy modularity partition
+from matplotlib import animation, colors
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 # =========================================================
 # 0) Repro & plotting config
@@ -400,3 +404,135 @@ HTML(anim.to_jshtml())
 adata.obs[["leiden_lib","leiden_custom"]].to_csv("pbmc3k_clusters_compare.csv")
 adata.write("pbmc3k_processed_compare.h5ad")
 print("Saved: pbmc3k_clusters_compare.csv, pbmc3k_processed_compare.h5ad")
+
+
+
+from mpl_toolkits.mplot3d import Axes3D  # enables 3D projection
+
+# Ensure 3D embedding exists
+sc.tl.umap(adata, n_components=3)
+umap3d = adata.obsm["X_umap"]
+
+def plot_umap3d(labels, title):
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    scatter = ax.scatter(
+        umap3d[:,0], umap3d[:,1], umap3d[:,2],
+        c=pd.Categorical(labels).codes,
+        cmap="tab20", s=10, alpha=0.8
+    )
+    ax.set_title(title)
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    plt.show()
+
+plot_umap3d(adata.obs["leiden_lib"], "3D UMAP — Leiden (library)")
+plot_umap3d(adata.obs["leiden_custom"], "3D UMAP — Leiden (custom)")
+
+
+
+
+# make sure 3D UMAP exists
+sc.tl.umap(adata, n_components=3)
+umap3d = adata.obsm["X_umap"]
+x, y, z = umap3d[:,0], umap3d[:,1], umap3d[:,2]
+
+def _stable_palette(labels):
+    cats = pd.Categorical(labels)
+    idxs = cats.codes
+    cmap = plt.colormaps['tab20']
+    base = cmap(np.linspace(0, 1, cmap.N))
+    return base[idxs % cmap.N], cats
+
+def umap3d_gif_detailed(
+    labels,
+    title,
+    filename="umap3d_detailed.gif",
+    n_frames=180,           # more frames => smoother & slower
+    elev=28,
+    spin_degrees=540,       # 1.5 turns so you see all sides
+    dpi=220,                # crisper
+    point_size=18,          # bigger points
+    zoom=(1.0, 0.65),       # zoom in more during spin
+    highlight="sequential", # None | "sequential"
+    dim_alpha=0.03,         # dim non-highlighted clusters harder
+    show_centroids=True,
+    depthshade=False        # keep color consistent with distance
+):
+    cols_base, cats = _stable_palette(labels)
+    labels = np.asarray(pd.Categorical(labels).codes)
+    uniq = np.unique(labels)
+    cluster_ix = {c: np.where(labels==c)[0] for c in uniq}
+
+    # sort once by z so nearer points draw on top (less occlusion)
+    order = np.argsort(z)
+    xs, ys, zs = x[order], y[order], z[order]
+    cols_sorted = cols_base[order]
+    labs_sorted = labels[order]
+
+    def _lims(arr, pad=0.05):
+        lo, hi = np.min(arr), np.max(arr)
+        rng = hi - lo
+        return lo - pad*rng, hi + pad*rng
+    xlim0, ylim0, zlim0 = _lims(xs), _lims(ys), _lims(zs)
+
+    fig = plt.figure(figsize=(8,7), dpi=dpi)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_title(title)
+
+    # outline underlayer + points (draw per cluster to reduce occlusion bias)
+    under_handles, scat_handles = [], []
+    for c in uniq:
+        idx = np.where(labs_sorted==c)[0]
+        under_handles.append(ax.scatter(xs[idx], ys[idx], zs[idx],
+                                        s=point_size*2.0, c="k", alpha=0.16,
+                                        depthshade=depthshade))
+        scat_handles.append(ax.scatter(xs[idx], ys[idx], zs[idx],
+                                       s=point_size, c=cols_sorted[idx],
+                                       alpha=0.98, depthshade=depthshade))
+
+    # centroids
+    texts = []
+    if show_centroids:
+        for c in uniq:
+            idx = cluster_ix[c]
+            if idx.size == 0: continue
+            cx, cy, cz = x[idx].mean(), y[idx].mean(), z[idx].mean()
+            texts.append(ax.text(cx, cy, cz, str(c), fontsize=10, color="black", alpha=0.85))
+
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    ax.set_axis_off()
+
+    def set_zoom(t):
+        zmin, zmax = zoom
+        f = 0.5*(1 - np.cos(2*np.pi*t))  # 0..1..0
+        zf = zmin*(1-f) + zmax*f
+        def interp(lim):
+            mid = 0.5*(lim[0]+lim[1]); half = 0.5*(lim[1]-lim[0])*zf
+            return (mid - half, mid + half)
+        ax.set_xlim(*interp(xlim0))
+        ax.set_ylim(*interp(ylim0))
+        ax.set_zlim(*interp(zlim0))
+
+    def update(i):
+        # camera
+        azim = (i / n_frames) * spin_degrees
+        ax.view_init(elev=elev, azim=azim)
+        set_zoom(i / n_frames)
+
+        # highlight one cluster at a time (optional)
+        if highlight == "sequential":
+            c = uniq[(i * len(uniq)) // n_frames]
+            for k, cval in enumerate(uniq):
+                alpha = 0.98 if cval == c else dim_alpha
+                scat_handles[k].set_alpha(alpha)
+        else:
+            for h in scat_handles: h.set_alpha(0.98)
+
+        ax.set_title(f"{title} — frame {i+1}/{n_frames}")
+        return tuple(scat_handles) + tuple(under_handles) + tuple(texts)
+
+    anim = animation.FuncAnimation(fig, update, frames=n_frames, interval=60, blit=True)
+    anim.save(filename, writer=animation.PillowWriter(fps=24))
+    plt.close(fig)
+    print(f"Saved: {filename}")
+
