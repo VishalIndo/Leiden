@@ -1,6 +1,9 @@
 # --- install if needed ---
 
 
+# --- install if needed ---
+
+
 %matplotlib inline
 import numpy as np, pandas as pd, scanpy as sc, matplotlib.pyplot as plt
 from sklearn.metrics import adjusted_rand_score as ARI
@@ -11,10 +14,6 @@ import random
 from queue import SimpleQueue
 from math import exp
 import leidenalg as la  # for Scanpy modularity partition
-from matplotlib import animation, colors
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 
 # =========================================================
 # 0) Repro & plotting config
@@ -51,17 +50,16 @@ sc.tl.umap(adata)
 
 # =========================================================
 # 2) Scanpy Leiden (library) on modularity for fair comparison
-#    (Scanpy default is CPM/RB; override to Modularity like your custom code)
 # =========================================================
 sc.tl.leiden(
     adata,
     key_added="leiden_lib",
     partition_type=la.ModularityVertexPartition,  # match your custom objective
-    resolution=None,                               # <-- IMPORTANT: modularity has no resolution
-    flavor="leidenalg",                            # keep current backend
-    directed=False,                                # neighbors graph is undirected
+    resolution=None,                               # modularity has no resolution
+    flavor="leidenalg",
+    directed=False,
     use_weights=True,
-    n_iterations=-1,                               # run optimiser to convergence (leidenalg)
+    n_iterations=-1,                               # run optimiser to convergence
 )
 print("Scanpy (library) leiden_lib clusters:", adata.obs["leiden_lib"].nunique())
 
@@ -248,7 +246,7 @@ def refine(graph, communities, refine_communities, simplified):
             if candidates:
                 target = candidates[int(np.argmax(weights))] if simplified else random.choices(candidates, weights)[0]
                 graph.vs[v][_refine] = target
-                update_communities(refine_communities, current_ref, target, community_edges, graph.vs[v][_multiplicity], self_edges, degree)
+                update_communities(refine_communities, current_ref, target, community_edges, self_edges=self_edges, multiplicity=graph.vs[v][_multiplicity], degree=degree)
                 neighbor_rep[target][_queued] = False; graph.vs[v][_queued] = False; converged = False
 
                 if not simplified:
@@ -316,6 +314,86 @@ labels_custom = np.array(g_custom.vs["comm"])
 adata.obs["leiden_custom"] = pd.Categorical(labels_custom.astype(str))
 print(f"Custom Leiden clusters: {adata.obs['leiden_custom'].nunique()}  |  Modularity: {mod_custom:.4f}")
 
+def leiden_with_snapshots_projected(graph, attr="comm", iterations=6, simplified=False):
+    """
+    Same as leiden_with_snapshots but returns ALL frames projected to the
+    ORIGINAL vertex set (length N0) so every frame has shape (N0,).
+    """
+    N0 = graph.vcount()
+    snaps = []
+
+    # Map from original vertex -> current graph index
+    current_map = np.arange(N0, dtype=int)
+
+    def _record_current_labels(label_attr):
+        """Project labels currently on `graph` onto original vertices via current_map."""
+        if label_attr in graph.vs.attributes():
+            lab = np.asarray(graph.vs[label_attr], dtype=int)
+            proj = lab[current_map]
+        else:
+            proj = np.zeros(N0, dtype=int)
+        snaps.append(proj.tolist())
+
+    # === Standard Leiden, but keep `current_map` updated across aggregations ===
+    initialiseGraph(graph)
+    communities = initialisePartition(graph, _comm)
+
+    # initial labels (each node = its own community)
+    _record_current_labels(_comm)
+
+    for _ in range(iterations):
+        # 1) local move on current graph
+        localMove(graph, communities)
+        _record_current_labels(_comm)
+
+        communities = cleanCommunities(communities)
+
+        # 2) refine step
+        refine_communities = initialisePartition(graph, _refine)
+        converged = refine(graph, communities, refine_communities, simplified)
+        _record_current_labels(_refine)
+        refine_communities = cleanCommunities(refine_communities)
+
+        graphs = [graph]
+        while not converged:
+            # 3) aggregate (coarsen) — update current_map using the fine->coarse indices
+            agg = aggregate(graph, refine_communities)  # sets graph.vs[_refineIndex] on the FINE graph
+            fine_to_coarse = np.asarray(graph.vs[_refineIndex], dtype=int)
+            current_map = fine_to_coarse[current_map]
+            graph = agg
+            graphs.append(graph)
+
+            # 4) local move again on the coarse graph
+            localMove(graph, communities)
+            _record_current_labels(_comm)
+            communities = cleanCommunities(communities)
+
+            # 5) refine again
+            converged = refine(graph, communities, refine_communities, simplified)
+            _record_current_labels(_refine)
+            refine_communities = cleanCommunities(refine_communities)
+
+        # deaggregate labels back to the finest graph (internal bookkeeping only)
+        for g_fine, g_coarse in zip(graphs[-2::-1], graphs[:0:-1]):
+            deAggregate(g_fine, g_coarse)
+        graph = graphs[0]
+
+    # final labels on the finest graph
+    graph.vs[attr] = graph.vs[_comm]
+
+    # clean attributes (like your original)
+    for k in (_comm, _refine, _refineIndex, _queued, _degree, _selfEdges):
+        if k in graph.vs.attributes(): del graph.vs[k]
+    if _wellconnected in graph.vs.attributes(): del graph.vs[_wellconnected]
+    if _m in graph.attributes(): del graph[_m]
+    renumber(graph, attr)
+
+    # record the final projected labels too
+    _record_current_labels(attr)
+
+    return quality(graph, attr), snaps
+
+
 # =========================================================
 # 5) Compare library vs custom (counts, ARI) + UMAPs
 # =========================================================
@@ -327,7 +405,7 @@ print("ARI (library vs custom):", ARI(y_lib, y_cus))
 sc.pl.umap(adata, color=["leiden_lib", "leiden_custom"], legend_loc="on data", frameon=False, size=20)
 
 # =========================================================
-# 6) Animation of custom color changes on UMAP
+# 6) (Optional) Animation of custom color changes on UMAP
 #     (re-runs custom Leiden with snapshots)
 # =========================================================
 def _record_snapshot(graph, attr, snaps):
@@ -368,7 +446,155 @@ def leiden_with_snapshots(graph, attr="comm", iterations=6, simplified=False):
 # Build animation frames
 g_anim = g.copy()
 random.seed(42)
-_, snapshots = leiden_with_snapshots(g_anim, attr="comm", iterations=6, simplified=False)
+_, snapshots = leiden_with_snapshots_projected(g_anim, attr="comm", iterations=6, simplified=False)
+adata3 = sc.tl.umap(adata, n_components=3, copy=True)  # if not already run
+X3 = adata3.obsm["X_umap"]
+x3, y3, z3 = X3[:,0], X3[:,1], X3[:,2]
+
+
+# === Added prints you requested previously ===
+final_labels = np.asarray(snapshots[-1], dtype=int)
+first_final_idx = next((i for i, fr in enumerate(snapshots)
+                        if np.array_equal(np.asarray(fr, dtype=int), final_labels)),
+                       len(snapshots) - 1)
+changes = sum(1 for i in range(1, len(snapshots))
+              if not np.array_equal(np.asarray(snapshots[i-1], dtype=int),
+                                    np.asarray(snapshots[i], dtype=int)))
+print(f"[Leiden snapshots] Frames before final clustering appears: {first_final_idx} / {len(snapshots)-1}")
+print(f"[Leiden snapshots] Number of label-change frames: {changes}")
+
+# ===================== PER-NODE CHANGE ANALYSIS & ALL-FRAMES DISPLAY (NEW) =====================
+
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib import colors
+_np_alias = np  # optional: alias if you want to reference np via _np_alias
+
+def snapshots_to_matrix(snapshots):
+    F = len(snapshots)
+    N = len(snapshots[-1])
+    M = np.zeros((F, N), dtype=int)
+    for i, fr in enumerate(snapshots):
+        fr = np.asarray(fr, dtype=int)
+        if fr.shape[0] != N:
+            raise ValueError(f"Snapshot {i} has {fr.shape[0]} nodes; expected {N}.")
+        M[i] = fr
+    return M
+
+def node_change_report(snapshots, names=None):
+    M = snapshots_to_matrix(snapshots)         # (F, N)
+    F, N = M.shape
+    last = M[-1]
+    chg = (M[1:] != M[:-1])                    # shape (F-1, N)
+    total_changes = chg.sum(axis=0)
+    change_frames = [np.where(chg[:, j])[0] + 1 for j in range(N)]
+    first_change = [int(fr[0]) if fr.size else -1 for fr in change_frames]
+    last_change  = [int(fr[-1]) if fr.size else -1 for fr in change_frames]
+
+    stabilized = []
+    for j in range(N):
+        k = 0
+        while k < F and not np.all(M[k:, j] == last[j]):
+            k += 1
+        stabilized.append(k if k < F else F-1)
+
+    df = pd.DataFrame({
+        "node_index": np.arange(N, dtype=int),
+        "name": list(names) if names is not None else np.arange(N, dtype=int),
+        "final_label": last,
+        "total_changes": total_changes,
+        "first_change_frame": first_change,
+        "last_change_frame": last_change,
+        "stabilized_at_frame": stabilized,
+    })
+
+    def path_str(col):
+        frames_to_keep = [0] + list(np.where(np.diff(col)!=0)[0] + 1)
+        return "; ".join(f"{f}:{int(col[f])}" for f in frames_to_keep)
+
+    df["label_path_compact"] = [path_str(M[:, j]) for j in range(N)]
+    return df, M
+
+def consistent_colors(all_labels, labels_now):
+    idx_map = {lab: i for i, lab in enumerate(sorted(all_labels))}
+    idxs = np.array([idx_map[z] for z in labels_now], dtype=int)
+    cmap = plt.colormaps['tab20']
+    norm = colors.Normalize(vmin=0, vmax=max(1, len(all_labels)-1))
+    return cmap(norm(idxs))
+
+def plot_leiden_grid(
+    snapshots, XY, ncols=6, mark_changes=True,
+    point_size=5, changed_size=18, unchanged_alpha=0.35,
+    dpi=170, suptitle="Leiden progression (all frames)"):
+    M = snapshots_to_matrix(snapshots)  # (F, N)
+    F, N = M.shape
+    x, y = XY[:, 0], XY[:, 1]
+    all_labels = set(M.flatten().tolist())
+
+    nrows = int(np.ceil(F / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3.2, nrows*3.1), dpi=dpi)
+    axes = np.ravel(axes) if isinstance(axes, np.ndarray) else [axes]
+
+    for f in range(F):
+        ax = axes[f]
+        cols = consistent_colors(all_labels, M[f])
+        if mark_changes and f > 0:
+            changed = (M[f] != M[f-1])
+            ax.scatter(x[~changed], y[~changed], s=point_size, c=cols[~changed], linewidths=0, alpha=unchanged_alpha)
+            ax.scatter(x[changed], y[changed], s=changed_size, c=cols[changed], linewidths=0, alpha=1.0)
+        else:
+            ax.scatter(x, y, s=point_size, c=cols, linewidths=0, alpha=1.0)
+        ax.set_title(f"Frame {f+1}/{F}", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_frame_on(False)
+
+    for k in range(F, len(axes)):
+        axes[k].axis("off")
+
+    plt.suptitle(suptitle, fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+def plot_node_timelines(snapshots, node_indices=None, max_nodes=60, sort_by="total_changes", names=None, dpi=170):
+    df, M = node_change_report(snapshots, names)
+    F, N = M.shape
+
+    if node_indices is None:
+        if sort_by == "stabilized_at":
+            df = df.sort_values(["stabilized_at_frame", "total_changes"], ascending=[True, False])
+        else:
+            df = df.sort_values(["total_changes", "stabilized_at_frame"], ascending=[False, True])
+        node_indices = df["node_index"].head(max_nodes).tolist()
+    else:
+        node_indices = list(node_indices)[:max_nodes]
+
+    subM = M[:, node_indices].T  # (k, F)
+    labs = sorted(set(subM.flatten().tolist()))
+    cmap = plt.colormaps['tab20']
+    lab_to_idx = {lab:i for i, lab in enumerate(labs)}
+    sub_idx = np.vectorize(lab_to_idx.get)(subM)
+
+    fig, ax = plt.subplots(figsize=(min(14, 0.2*F + 4), 0.28*len(node_indices) + 1), dpi=dpi)
+    im = ax.imshow(sub_idx, aspect='auto', interpolation='nearest')
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Nodes")
+    ax.set_title("Node label timelines (rows = nodes, columns = frames)")
+    ax.set_xticks(np.linspace(0, F-1, min(F, 10), dtype=int))
+    ax.set_yticks(np.arange(len(node_indices)))
+    ylabels = [str(df.loc[df["node_index"]==j, "name"].values[0]) for j in node_indices] if names is not None else [str(j) for j in node_indices]
+    ax.set_yticklabels(ylabels)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label("Cluster (remapped index)")
+    plt.tight_layout()
+    plt.show()
+
+# ===================== RUN REPORT + PLOTS (calls) =====================
+report_df, M_mat = node_change_report(snapshots, names=adata.obs_names)
+print(report_df.head(10))
+report_df.to_csv("leiden_node_change_report.csv", index=False)
+print("Saved: leiden_node_change_report.csv")
+
+# =========================================================
+# Back to your existing animation code
+# =========================================================
 XY = adata.obsm["X_umap"]; x, y = XY[:,0], XY[:,1]
 all_labels_sorted = sorted(set(l for frame in snapshots for l in frame))
 
@@ -379,6 +605,30 @@ def palette_from_labels(all_labels, labels_now):
     norm = colors.Normalize(vmin=0, vmax=max(1, len(all_labels)-1))
     return cmap(norm(idxs))
 
+# Grid of ALL frames with changed nodes emphasized
+plot_leiden_grid(
+    snapshots,
+    XY=adata.obsm["X_umap"],
+    ncols=6,
+    mark_changes=True,
+    point_size=5,
+    changed_size=16,
+    unchanged_alpha=0.35,
+    dpi=170,
+    suptitle="Leiden progression (all frames — changed nodes emphasized)"
+)
+
+# Optional: timelines of most-volatile nodes
+plot_node_timelines(
+    snapshots,
+    node_indices=None,       # or a list like [12, 87, 104]
+    max_nodes=60,
+    sort_by="total_changes", # or "stabilized_at"
+    names=adata.obs_names,
+    dpi=170
+)
+
+# === Your existing single-animation preview (kept intact) ===
 fig, ax = plt.subplots(figsize=(6.6, 6.2))
 cols0 = palette_from_labels(all_labels_sorted, snapshots[0])
 scat = ax.scatter(x, y, s=6, c=cols0, linewidths=0)
@@ -394,9 +644,9 @@ anim = animation.FuncAnimation(fig, update, frames=len(snapshots), interval=650,
 plt.close(fig)
 HTML(anim.to_jshtml())
 
-# Optional: save GIF
-# anim.save("pbmc3k_leiden_custom.gif", writer=animation.PillowWriter(fps=2))
-# print("Saved: pbmc3k_leiden_custom.gif")
+# Optional: save GIF or MP4 (to avoid notebook embed limit)
+# import matplotlib as mpl; mpl.rcParams['animation.embed_limit'] = 64  # MB
+# anim.save("pbmc3k_leiden_custom.mp4", writer="ffmpeg", fps=6)
 
 # =========================================================
 # 7) Save outputs
@@ -407,132 +657,165 @@ print("Saved: pbmc3k_clusters_compare.csv, pbmc3k_processed_compare.h5ad")
 
 
 
-from mpl_toolkits.mplot3d import Axes3D  # enables 3D projection
 
-# Ensure 3D embedding exists
-sc.tl.umap(adata, n_components=3)
-umap3d = adata.obsm["X_umap"]
+# ===================== 3D GIF with cluster numbers (robust) =====================
+import numpy as np, matplotlib.pyplot as plt
+from matplotlib import animation, colors
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-def plot_umap3d(labels, title):
-    fig = plt.figure(figsize=(7, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    scatter = ax.scatter(
-        umap3d[:,0], umap3d[:,1], umap3d[:,2],
-        c=pd.Categorical(labels).codes,
-        cmap="tab20", s=10, alpha=0.8
-    )
-    ax.set_title(title)
-    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
-    plt.show()
+F = len(snapshots)
+all_labels_sorted = sorted(set(l for fr in snapshots for l in fr))
 
-plot_umap3d(adata.obs["leiden_lib"], "3D UMAP — Leiden (library)")
-plot_umap3d(adata.obs["leiden_custom"], "3D UMAP — Leiden (custom)")
-
-
-
-
-# make sure 3D UMAP exists
-sc.tl.umap(adata, n_components=3)
-umap3d = adata.obsm["X_umap"]
-x, y, z = umap3d[:,0], umap3d[:,1], umap3d[:,2]
-
-def _stable_palette(labels):
-    cats = pd.Categorical(labels)
-    idxs = cats.codes
+def _palette(all_labels_sorted, labels_now):
+    idx_map = {lab:i for i, lab in enumerate(all_labels_sorted)}
+    idxs = np.array([idx_map[z] for z in labels_now], dtype=int)
     cmap = plt.colormaps['tab20']
-    base = cmap(np.linspace(0, 1, cmap.N))
-    return base[idxs % cmap.N], cats
+    norm = colors.Normalize(vmin=0, vmax=max(1, len(all_labels_sorted)-1))
+    return cmap(norm(idxs))  # (N,4)
 
-def umap3d_gif_detailed(
-    labels,
-    title,
-    filename="umap3d_detailed.gif",
-    n_frames=180,           # more frames => smoother & slower
-    elev=28,
-    spin_degrees=540,       # 1.5 turns so you see all sides
-    dpi=220,                # crisper
-    point_size=18,          # bigger points
-    zoom=(1.0, 0.65),       # zoom in more during spin
-    highlight="sequential", # None | "sequential"
-    dim_alpha=0.03,         # dim non-highlighted clusters harder
-    show_centroids=True,
-    depthshade=False        # keep color consistent with distance
-):
-    cols_base, cats = _stable_palette(labels)
-    labels = np.asarray(pd.Categorical(labels).codes)
-    uniq = np.unique(labels)
-    cluster_ix = {c: np.where(labels==c)[0] for c in uniq}
+fig = plt.figure(figsize=(7.2, 6.4), dpi=130)
+ax = fig.add_subplot(111, projection='3d')
 
-    # sort once by z so nearer points draw on top (less occlusion)
-    order = np.argsort(z)
-    xs, ys, zs = x[order], y[order], z[order]
-    cols_sorted = cols_base[order]
-    labs_sorted = labels[order]
+labs0 = np.asarray(snapshots[0], dtype=int)
+cols0 = _palette(all_labels_sorted, labs0)
 
-    def _lims(arr, pad=0.05):
-        lo, hi = np.min(arr), np.max(arr)
-        rng = hi - lo
-        return lo - pad*rng, hi + pad*rng
-    xlim0, ylim0, zlim0 = _lims(xs), _lims(ys), _lims(zs)
+# Base scatter: draw all points; we’ll set per-point RGBA each frame
+scat_base = ax.scatter(x3, y3, z3, s=8, c=cols0, depthshade=False)
 
-    fig = plt.figure(figsize=(8,7), dpi=dpi)
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_title(title)
+# Overlay for changed nodes (variable count per frame)
+scat_changed = ax.scatter([], [], [], s=28, c=np.empty((0,4)), depthshade=False)
 
-    # outline underlayer + points (draw per cluster to reduce occlusion bias)
-    under_handles, scat_handles = [], []
-    for c in uniq:
-        idx = np.where(labs_sorted==c)[0]
-        under_handles.append(ax.scatter(xs[idx], ys[idx], zs[idx],
-                                        s=point_size*2.0, c="k", alpha=0.16,
-                                        depthshade=depthshade))
-        scat_handles.append(ax.scatter(xs[idx], ys[idx], zs[idx],
-                                       s=point_size, c=cols_sorted[idx],
-                                       alpha=0.98, depthshade=depthshade))
+# For cluster numbers
+cluster_texts = []
 
-    # centroids
-    texts = []
-    if show_centroids:
-        for c in uniq:
-            idx = cluster_ix[c]
-            if idx.size == 0: continue
-            cx, cy, cz = x[idx].mean(), y[idx].mean(), z[idx].mean()
-            texts.append(ax.text(cx, cy, cz, str(c), fontsize=10, color="black", alpha=0.85))
+ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+ax.set_title(f"Leiden progression (3D) — frame 1/{F}")
+fig.tight_layout()
 
-    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
-    ax.set_axis_off()
+def _update_3d(i):
+    # labels & palette for this frame
+    labs = np.asarray(snapshots[i], dtype=int)
+    cols = _palette(all_labels_sorted, labs)       # (N,4)
 
-    def set_zoom(t):
-        zmin, zmax = zoom
-        f = 0.5*(1 - np.cos(2*np.pi*t))  # 0..1..0
-        zf = zmin*(1-f) + zmax*f
-        def interp(lim):
-            mid = 0.5*(lim[0]+lim[1]); half = 0.5*(lim[1]-lim[0])*zf
-            return (mid - half, mid + half)
-        ax.set_xlim(*interp(xlim0))
-        ax.set_ylim(*interp(ylim0))
-        ax.set_zlim(*interp(zlim0))
+    # changed mask vs previous frame
+    if i == 0:
+        changed_mask = np.zeros_like(labs, dtype=bool)
+    else:
+        prev = np.asarray(snapshots[i-1], dtype=int)
+        changed_mask = (labs != prev)
 
-    def update(i):
-        # camera
-        azim = (i / n_frames) * spin_degrees
-        ax.view_init(elev=elev, azim=azim)
-        set_zoom(i / n_frames)
+    # Base scatter: set points & per-point RGBA directly (no reading back)
+    scat_base._offsets3d = (x3, y3, z3)
+    rgba = cols.copy()
+    rgba[:, 3] = np.where(changed_mask, 0.35, 1.0)  # fade changed points underneath
+    scat_base.set_facecolors(rgba)                  # length == N always
 
-        # highlight one cluster at a time (optional)
-        if highlight == "sequential":
-            c = uniq[(i * len(uniq)) // n_frames]
-            for k, cval in enumerate(uniq):
-                alpha = 0.98 if cval == c else dim_alpha
-                scat_handles[k].set_alpha(alpha)
-        else:
-            for h in scat_handles: h.set_alpha(0.98)
+    # Overlay: only changed nodes; if none, set truly empty data
+    if changed_mask.any():
+        xC, yC, zC = x3[changed_mask], y3[changed_mask], z3[changed_mask]
+        cC = cols[changed_mask]                     # (k,4)
+        scat_changed._offsets3d = (xC, yC, zC)
+        scat_changed.set_facecolors(cC)
+    else:
+        scat_changed._offsets3d = (np.empty(0), np.empty(0), np.empty(0))
+        scat_changed.set_facecolors(np.empty((0,4)))
 
-        ax.set_title(f"{title} — frame {i+1}/{n_frames}")
-        return tuple(scat_handles) + tuple(under_handles) + tuple(texts)
+    # Remove previous labels safely
+    for t in cluster_texts:
+        try:
+            t.remove()
+        except Exception:
+            pass
+    cluster_texts.clear()
 
-    anim = animation.FuncAnimation(fig, update, frames=n_frames, interval=60, blit=True)
-    anim.save(filename, writer=animation.PillowWriter(fps=24))
-    plt.close(fig)
-    print(f"Saved: {filename}")
+    # Add cluster numbers at centroids for current frame
+    for c in np.unique(labs):
+        idx = (labs == c)
+        if not np.any(idx):
+            continue
+        cx, cy, cz = x3[idx].mean(), y3[idx].mean(), z3[idx].mean()
+        txt = ax.text(cx, cy, cz, str(int(c)), fontsize=9, ha='center', va='center',
+                      bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6))
+        cluster_texts.append(txt)
+
+    ax.set_title(f"Leiden progression (3D) — frame {i+1}/{F}")
+    return (scat_base, scat_changed, *cluster_texts)
+
+# Build and save GIF (avoid notebook embed size limits)
+anim3d = animation.FuncAnimation(fig, _update_3d, frames=F, interval=450, blit=False)
+gif3d_path = "pbmc3k_leiden_all_frames_3d.gif"
+anim3d.save(gif3d_path, writer=animation.PillowWriter(fps=4))
+plt.close(fig)
+print(f"Saved 3D GIF with cluster numbers: {gif3d_path}")
+# ==============================================================================
+
+# (If file size is large, try dpi=110, fps=5, or skip frames: frames=range(0, F, 2))
+
+
+# ===================== MAKE A SINGLE GIF FROM ALL FRAMES =====================
+from matplotlib import animation, colors
+import numpy as np, matplotlib.pyplot as plt
+
+# --- palette helper (consistent across frames) ---
+def _palette(all_labels_sorted, labels_now):
+    idx_map = {lab:i for i, lab in enumerate(all_labels_sorted)}
+    idxs = np.array([idx_map[z] for z in labels_now], dtype=int)
+    cmap = plt.colormaps['tab20']
+    norm = colors.Normalize(vmin=0, vmax=max(1, len(all_labels_sorted)-1))
+    return cmap(norm(idxs))
+
+# --- precompute ---
+F = len(snapshots)
+all_labels_sorted = sorted(set(l for fr in snapshots for l in fr))
+sx = np.asarray(x); sy = np.asarray(y)
+
+# --- build figure and artists once ---
+fig, ax = plt.subplots(figsize=(6.6, 6.2), dpi=140)
+cols0 = _palette(all_labels_sorted, snapshots[0])
+# base scatter (unchanged nodes each frame will be partially faded)
+scat_base = ax.scatter(sx, sy, s=6, c=cols0, linewidths=0, alpha=1.0)
+# overlay for changed nodes (larger points each frame)
+scat_changed = ax.scatter([], [], s=18, c=[], linewidths=0, alpha=1.0)
+
+ax.set_title(f"Leiden progression — frame 1/{F}")
+ax.set_xticks([]); ax.set_yticks([]); ax.set_frame_on(False)
+fig.tight_layout()
+
+# --- update per frame ---
+def _update(i):
+    labs = np.asarray(snapshots[i], dtype=int)
+    cols = _palette(all_labels_sorted, labs)
+
+    if i == 0:
+        changed_mask = np.zeros_like(labs, dtype=bool)
+    else:
+        prev = np.asarray(snapshots[i-1], dtype=int)
+        changed_mask = (labs != prev)
+
+    # base: draw all points; fade the ones that changed (they'll be overdrawn by 'changed' overlay)
+    alpha_base = np.where(changed_mask, 0.35, 1.0)  # fade changed ones underneath
+    scat_base.set_offsets(np.c_[sx, sy])
+    scat_base.set_facecolors(cols)
+    # unfortunately matplotlib scatter can't vary alpha per point directly via set_alpha,
+    # so we apply alpha into RGBA array:
+    rgba = scat_base.get_facecolors()
+    rgba[:, 3] = alpha_base
+    scat_base.set_facecolors(rgba)
+
+    # overlay: only changed nodes, larger markers, full opacity
+    scat_changed.set_offsets(np.c_[sx[changed_mask], sy[changed_mask]])
+    scat_changed.set_facecolors(cols[changed_mask] if changed_mask.any() else [])
+
+    ax.set_title(f"Leiden progression — frame {i+1}/{F}")
+    return scat_base, scat_changed
+
+anim = animation.FuncAnimation(fig, _update, frames=F, interval=450, blit=False)
+
+# --- save as GIF (no notebook embed limit) ---
+gif_path = "pbmc3k_leiden_all_frames.gif"
+anim.save(gif_path, writer=animation.PillowWriter(fps=4))
+plt.close(fig)
+print(f"Saved GIF: {gif_path}")
+# ============================================================================
+
 
