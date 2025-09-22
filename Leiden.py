@@ -1,9 +1,5 @@
 # --- install if needed ---
 
-
-# --- install if needed ---
-
-
 %matplotlib inline
 import numpy as np, pandas as pd, scanpy as sc, matplotlib.pyplot as plt
 from sklearn.metrics import adjusted_rand_score as ARI
