@@ -654,10 +654,15 @@ print("Saved: pbmc3k_clusters_compare.csv, pbmc3k_processed_compare.h5ad")
 
 
 
-# ===================== 3D GIF with cluster numbers (robust) =====================
+# ===================== 3D ROTATING GIF (colors + changed-node emphasis, no numbers) =====================
 import numpy as np, matplotlib.pyplot as plt
 from matplotlib import animation, colors
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+# ensure a 3D UMAP exists without touching your 2D embedding
+adata3 = sc.tl.umap(adata, n_components=3, copy=True)
+X3 = adata3.obsm["X_umap"]
+x3, y3, z3 = X3[:,0], X3[:,1], X3[:,2]
 
 F = len(snapshots)
 all_labels_sorted = sorted(set(l for fr in snapshots for l in fr))
@@ -675,77 +680,66 @@ ax = fig.add_subplot(111, projection='3d')
 labs0 = np.asarray(snapshots[0], dtype=int)
 cols0 = _palette(all_labels_sorted, labs0)
 
-# Base scatter: draw all points; we’ll set per-point RGBA each frame
+# base scatter: all points (we set per-point RGBA every frame)
 scat_base = ax.scatter(x3, y3, z3, s=8, c=cols0, depthshade=False)
 
-# Overlay for changed nodes (variable count per frame)
+# overlay for changed nodes (only those, bigger points)
 scat_changed = ax.scatter([], [], [], s=28, c=np.empty((0,4)), depthshade=False)
 
-# For cluster numbers
-cluster_texts = []
-
+# clean axes
 ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
 ax.set_title(f"Leiden progression (3D) — frame 1/{F}")
 fig.tight_layout()
 
-def _update_3d(i):
-    # labels & palette for this frame
-    labs = np.asarray(snapshots[i], dtype=int)
-    cols = _palette(all_labels_sorted, labs)       # (N,4)
+# rotation config
+start_azim = 30.0
+start_elev = 18.0
+turns = 1.0                       # full 360° turns across all frames
+azim_step = 360.0 * turns / max(1, F-1)
+elev_amp = 4.0                    # gentle nod
+elev_phase = np.linspace(0, 2*np.pi*turns, F)
 
-    # changed mask vs previous frame
+def _update(i):
+    labs = np.asarray(snapshots[i], dtype=int)
+    cols = _palette(all_labels_sorted, labs)
+
     if i == 0:
         changed_mask = np.zeros_like(labs, dtype=bool)
     else:
         prev = np.asarray(snapshots[i-1], dtype=int)
         changed_mask = (labs != prev)
 
-    # Base scatter: set points & per-point RGBA directly (no reading back)
-    scat_base._offsets3d = (x3, y3, z3)
+    # base layer with per-point alpha (fade changed nodes)
     rgba = cols.copy()
-    rgba[:, 3] = np.where(changed_mask, 0.35, 1.0)  # fade changed points underneath
-    scat_base.set_facecolors(rgba)                  # length == N always
+    rgba[:, 3] = np.where(changed_mask, 0.35, 1.0)
+    scat_base._offsets3d = (x3, y3, z3)
+    scat_base.set_facecolors(rgba)
 
-    # Overlay: only changed nodes; if none, set truly empty data
+    # overlay only changed nodes
     if changed_mask.any():
-        xC, yC, zC = x3[changed_mask], y3[changed_mask], z3[changed_mask]
-        cC = cols[changed_mask]                     # (k,4)
-        scat_changed._offsets3d = (xC, yC, zC)
-        scat_changed.set_facecolors(cC)
+        scat_changed._offsets3d = (x3[changed_mask], y3[changed_mask], z3[changed_mask])
+        scat_changed.set_facecolors(cols[changed_mask])
     else:
         scat_changed._offsets3d = (np.empty(0), np.empty(0), np.empty(0))
         scat_changed.set_facecolors(np.empty((0,4)))
 
-    # Remove previous labels safely
-    for t in cluster_texts:
-        try:
-            t.remove()
-        except Exception:
-            pass
-    cluster_texts.clear()
-
-    # Add cluster numbers at centroids for current frame
-    for c in np.unique(labs):
-        idx = (labs == c)
-        if not np.any(idx):
-            continue
-        cx, cy, cz = x3[idx].mean(), y3[idx].mean(), z3[idx].mean()
-        txt = ax.text(cx, cy, cz, str(int(c)), fontsize=9, ha='center', va='center',
-                      bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6))
-        cluster_texts.append(txt)
+    # rotate view
+    az = start_azim + azim_step * i
+    el = start_elev + elev_amp * np.sin(elev_phase[i])
+    ax.view_init(elev=el, azim=az)
 
     ax.set_title(f"Leiden progression (3D) — frame {i+1}/{F}")
-    return (scat_base, scat_changed, *cluster_texts)
+    return scat_base, scat_changed
 
-# Build and save GIF (avoid notebook embed size limits)
-anim3d = animation.FuncAnimation(fig, _update_3d, frames=F, interval=450, blit=False)
-gif3d_path = "pbmc3k_leiden_all_frames_3d.gif"
-anim3d.save(gif3d_path, writer=animation.PillowWriter(fps=4))
+anim3d = animation.FuncAnimation(fig, _update, frames=F, interval=450, blit=False)
+
+# save as a single GIF (avoids notebook embed limit)
+gif_path = "pbmc3k_leiden_3d_rotate.gif"
+anim3d.save(gif_path, writer=animation.PillowWriter(fps=4))
 plt.close(fig)
-print(f"Saved 3D GIF with cluster numbers: {gif3d_path}")
-# ==============================================================================
+print(f"Saved 3D rotating GIF: {gif_path}")
+# ===============================================================================================
 
-# (If file size is large, try dpi=110, fps=5, or skip frames: frames=range(0, F, 2))
 
 
 # ===================== MAKE A SINGLE GIF FROM ALL FRAMES =====================
